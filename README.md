@@ -136,3 +136,16 @@ Once its all-parts-saved confirmation appears, navigating away is safe.
 The VPS needs enough free disk space to retain multiple lecture videos while
 the Telegram worker uploads them. The queue lives on the VPS; the Tampermonkey
 queue list is only a convenience display for jobs created by that browser.
+
+
+## Adjustable browser upload workers (userscript v3.5.0)
+
+The Tampermonkey panel now has a **Workers: N** button. Click it to set
+1–10 parallel browser-to-VPS video-part transfers (default 5), saved in
+Tampermonkey storage. The new value applies on the **next** lecture transfer;
+changes are disallowed while a transfer is active. Suggested 3–5 on regular
+connections; try 2–3 if the site/network throttles or browser RAM grows.
+This does not increase how many Telegram videos the server sends at once:
+the Telegram upload queue remains sequential to avoid resource contention.
+Pyrogram's `Client(workers=4)` setting is for incoming update handlers,
+not simultaneous upload parts.
