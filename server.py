@@ -28,6 +28,7 @@ pyrogram_utils.MIN_CHANNEL_ID = min(
     pyrogram_utils.MIN_CHANNEL_ID, -1009999999999
 )
 from browser_upload import setup_browser_upload
+from video_metadata import video_info, create_thumbnail
 
 load_dotenv()
 
@@ -513,31 +514,43 @@ async def process(job):
             f"{size_mb:.1f} MB"
         )
 
+        metadata = await video_info(output, root, len(parts))
+        thumb = await create_thumbnail(output, root / "telegram_thumb.jpg", metadata["duration"])
+        LOG.info(
+            "Video metadata: %ss %sx%s",
+            metadata["duration"], metadata["width"], metadata["height"]
+        )
         upload_state = {"last": 0.0}
+        started = time.monotonic()
+        loop = asyncio.get_running_loop()
 
-        async def upload_progress(current, total):
-            job["upload_percent"] = (
-                round(current * 100 / total, 1)
-                if total else 0
+        async def report_progress(current, total, elapsed):
+            job["upload_percent"] = round(current * 100 / total, 1) if total else 0
+            speed = current / (1024**2) / max(elapsed, 0.001)
+            LOG.info("Telegram upload job=%s %.1f%% speed=%.2f MB/s",
+                     job["id"], job["upload_percent"], speed)
+            await send_progress(
+                msg,
+                f"📤 {job['title']} | {job['upload_percent']}% | {speed:.2f} MB/s",
+                last_edit
             )
 
-            if (
-                time.monotonic()
-                - upload_state["last"] > 8
-            ):
-                upload_state["last"] = time.monotonic()
+        def upload_progress(current, total):
+            now = time.monotonic()
+            if now - upload_state["last"] < 5 and current < total:
+                return
+            upload_state["last"] = now
+            loop.create_task(report_progress(current, total, now - started))
 
-                await send_progress(
-                    msg,
-                    f"📤 {job['title']}\n"
-                    f"Uploading: {job['upload_percent']}%",
-                    last_edit
-                )
-
+        await client.get_chat(TG_CHAT_ID)
         await client.send_video(
             chat_id=TG_CHAT_ID,
             video=str(output),
             caption=f"🎬 {job['title']}",
+            duration=metadata["duration"],
+            width=metadata["width"],
+            height=metadata["height"],
+            thumb=thumb,
             supports_streaming=True,
             progress=upload_progress
         )
