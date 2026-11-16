@@ -18,7 +18,7 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 LOG = logging.getLogger("lecturebot.browser")
-CHUNK_LIMIT = 4 * 1024 * 1024
+CHUNK_LIMIT = 10 * 1024 * 1024
 MAX_PART_SIZE = 1024 * 1024 * 1024
 
 
