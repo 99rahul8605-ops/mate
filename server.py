@@ -18,7 +18,7 @@ import aiohttp
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
-from telethon import TelegramClient, events
+from pyrogram import Client, filters
 from browser_upload import setup_browser_upload
 
 load_dotenv()
@@ -51,10 +51,13 @@ if not all((
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-client = TelegramClient(
-    str(DATA_DIR / "bot_session"),
-    TG_API_ID,
-    TG_API_HASH
+client = Client(
+    "bot_session_pyrogram",
+    api_id=TG_API_ID,
+    api_hash=TG_API_HASH,
+    bot_token=TG_BOT_TOKEN,
+    workdir=str(DATA_DIR),
+    workers=4,
 )
 
 queue = asyncio.Queue()
@@ -253,7 +256,7 @@ async def send_progress(msg, message, last_edit):
         return
 
     try:
-        await msg.edit(message[:4000])
+        await msg.edit_text(message[:4000])
         last_edit[0] = time.monotonic()
     except Exception as exc:
         LOG.warning(
@@ -447,7 +450,7 @@ async def process(job):
 
         job_status(job, "merging")
 
-        await msg.edit(
+        await msg.edit_text(
             f"🔧 Merging {len(parts)} parts\n"
             f"{job['title']}"
         )
@@ -497,7 +500,7 @@ async def process(job):
 
         size_mb = output.stat().st_size / 1024**2
 
-        await msg.edit(
+        await msg.edit_text(
             f"📤 Uploading {job['title']}\n"
             f"{size_mb:.1f} MB"
         )
@@ -523,13 +526,12 @@ async def process(job):
                     last_edit
                 )
 
-        await client.send_file(
-            TG_CHAT_ID,
-            str(output),
+        await client.send_video(
+            chat_id=TG_CHAT_ID,
+            video=str(output),
             caption=f"🎬 {job['title']}",
             supports_streaming=True,
-            progress_callback=upload_progress,
-            force_document=False
+            progress=upload_progress
         )
 
         job_status(
@@ -538,7 +540,7 @@ async def process(job):
             f"Sent {size_mb:.1f} MB to Telegram"
         )
 
-        await msg.edit(
+        await msg.edit_text(
             f"✅ Sent: {job['title']}\n"
             f"{size_mb:.1f} MB"
         )
@@ -558,7 +560,7 @@ async def process(job):
 
         if msg:
             try:
-                await msg.edit(
+                await msg.edit_text(
                     f"❌ {job['title']} failed:\n"
                     f"{str(exc)[:500]}"
                 )
@@ -582,13 +584,11 @@ async def worker():
             queue.task_done()
 
 
-@client.on(events.NewMessage(
-    pattern=r"^/start(?:\s|$)"
-))
-async def start_message(event):
-    await event.respond(
+@client.on_message(filters.command("start"))
+async def start_message(_client, message):
+    await message.reply_text(
         "Lecture receiver online.\n"
-        f"Your chat ID: {event.chat_id}"
+        f"Your chat ID: {message.chat.id}"
     )
 
 
@@ -596,9 +596,7 @@ async def start_message(event):
 async def lifespan(app):
     global worker_task
 
-    await client.start(
-        bot_token=TG_BOT_TOKEN
-    )
+    await client.start()
 
     worker_task = asyncio.create_task(
         worker()
@@ -613,7 +611,7 @@ async def lifespan(app):
     except asyncio.CancelledError:
         pass
 
-    await client.disconnect()
+    await client.stop()
 
 
 app = FastAPI(
