@@ -105,7 +105,7 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
             "completed_parts": complete,
             "offsets": offsets,
             "upload_percent": record.get("upload_percent", 0),
-            "queue_position": job_queue.qsize() if record.get("phase") == "queued" else None,
+            "queue_length": job_queue.qsize(),
             "upload_speed_mbps": record.get("upload_speed_mbps", 0),
             "telegram_message_id": record.get("telegram_message_id"),
         }
@@ -188,7 +188,13 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
             if not part_ok(partial):
                 raise HTTPException(status_code=422, detail="Part is not an MP4")
             os.replace(partial, target)
-            return {"complete": True}
+            # The final finished part is enough to queue the job.
+            # This also works when the browser closes before /complete.
+            complete_parts, _ = part_state(path, record)
+            auto_queued = False
+            if len(complete_parts) == record["total_parts"]:
+                auto_queued = enqueue(path, record)
+            return {"complete": True, "queued": auto_queued}
 
     async def finalize(job_id):
         path, record = load(job_id)
@@ -385,14 +391,21 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
                 path = meta.parent
                 record = json.loads(meta.read_text("utf-8"))
                 phase = record.get("phase")
-                if phase in ("complete", "receiving"):
+                if record.get("telegram_message_id"):
+                    if phase != "complete":
+                        record["phase"] = "complete"
+                        record["detail"] = "Already delivered to Telegram"
+                        save(path, record)
                     continue
-                if phase == "failed":
-                    if int(record.get("auto_retry_count", 0)) >= max_auto_retries:
-                        continue
-                elif phase not in ("queued", "merging", "uploading"):
+                if phase == "complete":
+                    continue
+                if phase not in ("receiving", "queued", "merging", "uploading", "failed"):
                     continue
                 if not is_ready(path, record):
+                    continue
+                retries = int(record.get("auto_retry_count", 0))
+                if phase in ("failed", "merging", "uploading") and retries >= max_auto_retries:
+                    LOG.warning("Browser queue: job=%s reached retry limit", record["id"])
                     continue
                 recovered.append((phase not in ("uploading", "merging"),
                                   record.get("updated", ""), path, record))
@@ -400,7 +413,7 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
                 LOG.exception("Browser queue: cannot recover %s", meta)
         recovered.sort(key=lambda x: (x[0], x[1]))
         for _, _, path, record in recovered:
-            if record["phase"] == "failed":
+            if record["phase"] in ("failed", "merging", "uploading"):
                 record["auto_retry_count"] = int(record.get("auto_retry_count", 0)) + 1
             enqueue(path, record)
         LOG.info("Browser queue started: %s recovered jobs", len(recovered))
