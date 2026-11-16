@@ -521,10 +521,12 @@ async def process(job):
         )
 
         metadata = await video_info(output, root, len(parts))
-        # Let Telegram generate the preview; standalone Pyrogram send works without a custom thumb.
+        thumb = await create_thumbnail(
+            output, root / "telegram_thumb.jpg", metadata["duration"]
+        )
         LOG.info(
-            "Video metadata: %ss %sx%s",
-            metadata["duration"], metadata["width"], metadata["height"]
+            "Video metadata: %ss %sx%s thumbnail=%s",
+            metadata["duration"], metadata["width"], metadata["height"], bool(thumb)
         )
         upload_state = {"last": 0.0}
         started = time.monotonic()
@@ -553,6 +555,7 @@ async def process(job):
             duration=metadata["duration"],
             width=metadata["width"],
             height=metadata["height"],
+            thumb=thumb,
             supports_streaming=True,
             progress=upload_progress
         )
