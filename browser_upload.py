@@ -238,8 +238,8 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
                 )
                 try:
                     await msg.edit_text(
-                        f"📤 {record['title']}\\n"
-                        f"{pct:.1f}% | {done / 1024**2:.1f}/{total / 1024**2:.1f} MB\\n"
+                        f"📤 {record['title']}\n"
+                        f"{pct:.1f}% | {done / 1024**2:.1f}/{total / 1024**2:.1f} MB\n"
                         f"{mbps:.2f} MB/s"
                     )
                 except Exception as exc:
