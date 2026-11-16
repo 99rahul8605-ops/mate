@@ -68,3 +68,21 @@ thumbnail of a video message that has already been delivered. Re-upload a
 verified MP4 to replace the bad presentation, and remove the old message manually
 if appropriate. No retranscoding is performed by default; if the source MP4 has
 broken playback timestamps, fix/re-encode the media separately.
+
+
+## Pyrogram upload troubleshooting (November 2026)
+
+For a large MP4 that already passed FFprobe, the Telegram upload uses a
+synchronous progress callback and does not send a custom JPEG thumbnail. The
+previous approach could stall near 0.1%; the standalone CLI send without a
+custom thumbnail had successfully completed. Duration, frame width, and height
+are still passed explicitly to Pyrogram, with Telegram generating the preview.
+
+On retries, a valid existing `lecture_final.mp4` is reused, without remuxing
+again. Progress is logged every few seconds and stored in job metadata. Do not
+restart an active upload. Before retrying a job stuck with `phase=uploading`
+after a restart, set its metadata phase to `failed`; only do this when no
+active upload for that job remains. The `/complete` endpoint then retries
+using the existing parts and merged MP4. First verify the output video's
+FFprobe duration and dimensions; if Telegram still shows 00:00 after a new
+send, its playback/file content requires further investigation.
