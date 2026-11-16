@@ -115,3 +115,24 @@ Deployment: let any active upload finish before `git pull` and restarting
 the API. Run `venv/bin/python -m py_compile server.py browser_upload.py`
 then restart as usual. Follow `server.log` for
 `Browser queue: queued`, `starting`, `retrying`, and `finished` entries.
+
+## Download the next lecture while Telegram uploads the previous one
+
+Tampermonkey userscript v3.4.0 now treats the browser transfer and Telegram
+upload as independent stages:
+
+1. Play a lecture and click `Upload Lecture`.
+2. Once **all parts are saved on the VPS**, the server queues that job and the
+   userscript immediately releases the upload button. There is no need to wait
+   for FFmpeg or Telegram.
+3. Navigate to the next lecture in the same page/browser tab and click
+   `Upload Lecture` again. The browser downloads its parts while the
+   server's sequential queue is busy with the prior lecture.
+4. The new `Queue` button shows saved jobs and their phase/progress (refreshed
+   automatically every 20 seconds while the transfer button is idle).
+
+Do not navigate away while the **browser-to-VPS transfer** is still active.
+Once its all-parts-saved confirmation appears, navigating away is safe.
+The VPS needs enough free disk space to retain multiple lecture videos while
+the Telegram worker uploads them. The queue lives on the VPS; the Tampermonkey
+queue list is only a convenience display for jobs created by that browser.
