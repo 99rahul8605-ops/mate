@@ -16,6 +16,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel, Field
+from video_metadata import video_info, create_thumbnail
 
 LOG = logging.getLogger("lecturebot.browser")
 CHUNK_LIMIT = 10 * 1024 * 1024
@@ -206,27 +207,64 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
             if proc.returncode or not part_ok(output):
                 raise RuntimeError("FFmpeg merge failed: " +
                                    error.decode(errors="replace")[-600:])
+            metadata = await video_info(output, path, record["total_parts"])
+            thumb = await create_thumbnail(output, path / "telegram_thumb.jpg", metadata["duration"])
+            LOG.info(
+                "Video info job=%s duration=%ss resolution=%sx%s thumbnail=%s",
+                job_id, metadata["duration"], metadata["width"],
+                metadata["height"], bool(thumb)
+            )
+            record["duration"] = metadata["duration"]
+            record["width"] = metadata["width"]
+            record["height"] = metadata["height"]
             record["phase"] = "uploading"
             save(path, record)
             size_mb = output.stat().st_size / (1024**2)
             await msg.edit_text(f"📤 Uploading {record['title']} ({size_mb:.1f} MB)")
             last = [0.0]
+            started = time.monotonic()
+            loop = asyncio.get_running_loop()
 
-            async def progress(done, total):
-                record["upload_percent"] = round(100 * done / total, 1) if total else 0
-                if time.monotonic() - last[0] > 8:
-                    last[0] = time.monotonic()
-                    try:
-                        await msg.edit_text(
-                            f"📤 {record['title']}\nUploading: {record['upload_percent']}%"
-                        )
-                    except Exception:
-                        pass
+            async def report_upload(done, total, elapsed):
+                pct = round(100 * done / total, 1) if total else 0.0
+                mbps = done / (1024**2) / max(elapsed, 0.001)
+                record["upload_percent"] = pct
+                record["upload_mb"] = round(done / 1024**2, 1)
+                record["upload_speed_mbps"] = round(mbps, 2)
+                save(path, record)
+                LOG.info(
+                    "Telegram upload job=%s %.1f%% %.1f/%.1f MB %.2f MB/s",
+                    job_id, pct, done / 1024**2, total / 1024**2, mbps
+                )
+                try:
+                    await msg.edit_text(
+                        f"📤 {record['title']}\\n"
+                        f"{pct:.1f}% | {done / 1024**2:.1f}/{total / 1024**2:.1f} MB\\n"
+                        f"{mbps:.2f} MB/s"
+                    )
+                except Exception as exc:
+                    LOG.debug("Telegram progress message edit skipped: %s", exc)
 
+            def progress(done, total):
+                # Pyrogram calls this as a regular function; never return
+                # an unawaited coroutine to its synchronous upload pipeline.
+                now = time.monotonic()
+                if now - last[0] < 5 and done < total:
+                    return
+                last[0] = now
+                loop.create_task(report_upload(done, total, now - started))
+
+            # Resolve the peer while the client is active, not only when
+            # sending the file (fresh Pyrogram peer cache may be empty).
+            await client.get_chat(chat_id)
             await client.send_video(
                 chat_id=chat_id,
                 video=str(output),
                 caption=f"🎬 {record['title']}",
+                duration=metadata["duration"],
+                width=metadata["width"],
+                height=metadata["height"],
+                thumb=thumb,
                 supports_streaming=True,
                 progress=progress,
             )
@@ -239,6 +277,7 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
                 f.unlink(missing_ok=True)
             output.unlink(missing_ok=True)
             concat.unlink(missing_ok=True)
+            (path / "telegram_thumb.jpg").unlink(missing_ok=True)
         except Exception as exc:
             LOG.exception("Browser upload job %s failed", job_id)
             record["phase"] = "failed"
