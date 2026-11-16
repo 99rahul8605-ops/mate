@@ -209,7 +209,7 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
             record["phase"] = "uploading"
             save(path, record)
             size_mb = output.stat().st_size / (1024**2)
-            await msg.edit(f"📤 Uploading {record['title']} ({size_mb:.1f} MB)")
+            await msg.edit_text(f"📤 Uploading {record['title']} ({size_mb:.1f} MB)")
             last = [0.0]
 
             async def progress(done, total):
@@ -217,21 +217,23 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
                 if time.monotonic() - last[0] > 8:
                     last[0] = time.monotonic()
                     try:
-                        await msg.edit(
+                        await msg.edit_text(
                             f"📤 {record['title']}\nUploading: {record['upload_percent']}%"
                         )
                     except Exception:
                         pass
 
-            await client.send_file(
-                chat_id, str(output), caption=f"🎬 {record['title']}",
-                supports_streaming=True, force_document=False,
-                progress_callback=progress,
+            await client.send_video(
+                chat_id=chat_id,
+                video=str(output),
+                caption=f"🎬 {record['title']}",
+                supports_streaming=True,
+                progress=progress,
             )
             record["phase"] = "complete"
             record["detail"] = f"Sent {size_mb:.1f} MB to Telegram"
             save(path, record)
-            await msg.edit(f"✅ Sent: {record['title']} ({size_mb:.1f} MB)")
+            await msg.edit_text(f"✅ Sent: {record['title']} ({size_mb:.1f} MB)")
             # Keep metadata for status checks; remove only large media.
             for f in path.glob("part_*"):
                 f.unlink(missing_ok=True)
@@ -244,7 +246,7 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
             save(path, record)
             if msg:
                 try:
-                    await msg.edit(f"❌ {record['title']} failed: {str(exc)[:400]}")
+                    await msg.edit_text(f"❌ {record['title']} failed: {str(exc)[:400]}")
                 except Exception:
                     pass
         finally:
