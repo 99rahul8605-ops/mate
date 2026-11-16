@@ -18,7 +18,15 @@ import aiohttp
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
-from pyrogram import Client, filters
+from pyrogram import Client, filters, utils as pyrogram_utils
+
+# Pyrogram 2.0.106's channel-ID lower bound predates newer Telegram
+# supergroup/channel IDs (e.g. -1003697529293). Its get_peer_type()
+# raises ValueError before attempting Telegram peer resolution.
+# Expand only the accepted channel range; permissions/access still apply.
+pyrogram_utils.MIN_CHANNEL_ID = min(
+    pyrogram_utils.MIN_CHANNEL_ID, -1009999999999
+)
 from browser_upload import setup_browser_upload
 
 load_dotenv()
