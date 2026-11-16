@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MyCAMate Browser Upload to Telegram
 // @namespace    local.lecture.transfer
-// @version      3.4.0
+// @version      3.5.0
 // @description  Upload authorized lecture MP4 parts from this browser to Railway for merging and Telegram delivery.
 // @match        https://foundation.badassworks.xyz/*
 // @run-at       document-idle
@@ -17,7 +17,12 @@
   const VIDEO = 'video.badassworks.xyz';
   const ID = 'lecture-browser-transfer-v3';
   const CHUNK = 10 * 1024 * 1024;
-  const PARALLEL_PARTS = 5;
+  const DEFAULT_PARALLEL_PARTS = 5;
+  const WORKERS_KEY = "browser_upload_workers";
+  const getWorkers = () => {
+    const saved = Number(GM_getValue(WORKERS_KEY, DEFAULT_PARALLEL_PARTS));
+    return Number.isInteger(saved) && saved >= 1 && saved <= 10 ? saved : DEFAULT_PARALLEL_PARTS;
+  };
   const SAVED_JOBS = 'lecture_upload_queue_v1';
   if (document.getElementById(ID)) return;
   let active = false, cancel = false;
@@ -40,6 +45,9 @@
   settings.textContent = '⚙ API Key';
   const stop = document.createElement('button');
   stop.textContent = '⏸ Pause';
+  const workersButton = document.createElement('button');
+  const setWorkersLabel = () => { workersButton.textContent = '⚙ Workers: '+getWorkers(); };
+  setWorkersLabel();
   const queuedButton = document.createElement('button');
   queuedButton.textContent = '📋 Queue';
   const queueStatus = document.createElement('div');
@@ -47,11 +55,11 @@
   const status = document.createElement('div');
   status.textContent = 'Play lecture, then upload.';
   status.style.cssText = 'font-size:11px;margin-top:9px;overflow-wrap:anywhere;line-height:1.4';
-  for (const b of [send,settings,stop,queuedButton]) {
+  for (const b of [send,settings,workersButton,stop,queuedButton]) {
     b.style.cssText = 'cursor:pointer;border:0;border-radius:7px;padding:8px;margin:3px 2px;background:#2563eb;color:white;font-size:12px';
   }
   stop.style.background = '#475569';
-  root.append(title,send,settings,stop,queuedButton,status,queueStatus);
+  root.append(title,send,settings,workersButton,stop,queuedButton,status,queueStatus);
   (document.body || document.documentElement).appendChild(root);
   const say = value => {status.textContent = value;console.log('[LectureUpload]',value);};
   function getSavedKey() {
@@ -228,6 +236,22 @@
       say('API key saved in Tampermonkey for future uploads');
     }
   };
+  workersButton.onclick=()=>{
+    if(active) {
+      say('Wait until the current browser-to-VPS transfer finishes to change workers.');
+      return;
+    }
+    const entered=prompt('Parallel browser transfer workers (1-10). Recommended: 3-5. Applies to next lecture.', String(getWorkers()));
+    if(entered===null)return;
+    const value=Number(entered.trim());
+    if(!Number.isInteger(value) || value < 1 || value > 10) {
+      alert('Enter a whole number from 1 to 10.');
+      return;
+    }
+    GM_setValue(WORKERS_KEY,value);
+    setWorkersLabel();
+    say('✅ Browser workers saved: '+value+'. Will apply to the next transfer.');
+  };
   stop.onclick=()=>{cancel=true;say('Pausing after current request. Resume by clicking Upload Lecture.');};
   async function uploadPart(job, i, u, key, knownOffset=0) {
     // Requesting media bytes from the browser network, NOT from Railway.
@@ -308,6 +332,7 @@
         rememberJob(job,state.title||'Lecture '+lectureId,lectureId);
       const already=new Set(state.completed_parts||[]);
       const pending=Array.from({length:count},(_,i)=>i).filter(i=>!already.has(i));
+      const parallelWorkers=getWorkers();
       const startedAt=Date.now();
       let next=0, uploaded=already.size, failed=null;
       const speed=() => ((Date.now()-startedAt)/1000).toFixed(0)+'s';
@@ -321,7 +346,7 @@
               throw new Error('Signed link expired. Reopen the lecture and resume.');
             const u=new URL(manifest);
             u.pathname=(i%2===0?'/p/':'/b/')+i;
-            say('⬇️ '+(uploaded)+'/'+count+' saved | Active workers: '+PARALLEL_PARTS);
+            say('⬇️ '+(uploaded)+'/'+count+' saved | Browser workers: '+parallelWorkers);
             const ok=await uploadPart(job,i,u.toString(),key,Number(state.offsets?.[String(i)]||0));
             if(!ok) return;
             uploaded++;
@@ -333,7 +358,7 @@
           }
         }
       }
-      await Promise.all(Array.from({length:Math.min(PARALLEL_PARTS,pending.length)},()=>worker()));
+      await Promise.all(Array.from({length:Math.min(parallelWorkers,pending.length)},()=>worker()));
       if(failed) throw failed;
       if(cancel) {say('Paused. Reopen lecture and click Upload Lecture to resume.');return;}
       // /complete only queues the job; it never waits for Telegram delivery.
