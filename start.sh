@@ -19,6 +19,14 @@ if [[ "${1:-}" == "--serve" ]]; then
   exec "$DIR/venv/bin/uvicorn" server:app --host 0.0.0.0 --port "${PORT:-8094}"
 fi
 
+# Explicit restart: stop ONLY the previous mate-api screen and launch a new one.
+# Normal invocation remains idempotent and does not interrupt active uploads.
+case "${1:-}" in
+  "") ;;
+  restart) FORCE_RESTART=1 ;;
+  *) fail "Usage: bash start.sh [restart]" ;;
+esac
+
 for cmd in screen git curl python3 ffmpeg ffprobe; do
   command -v "$cmd" >/dev/null 2>&1 || fail "Missing $cmd. Install it first."
 done
@@ -45,13 +53,16 @@ healthy() { curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/health" | grep -Eq 
 if have_screen && healthy && [[ "${FORCE_RESTART:-0}" != 1 ]]; then
   info "✅ mate-api already running in screen on port $PORT. No restart needed."
   info "   Logs: tail -f $LOG"
-  info "   To update/restart later: FORCE_RESTART=1 bash start.sh (interrupts active uploads)"
+  info "   To update/restart later: bash start.sh restart (interrupts active uploads)"
   exit 0
 fi
 if ! have_screen && healthy; then
   fail "API already running outside mate-api screen. Stop that foreground process first (Ctrl+C); refusing duplicate Pyrogram session."
 fi
 
+if [[ "${1:-}" == "restart" ]]; then
+  info "♻️ Restart requested: old mate-api screen will be replaced (active uploads interrupted)."
+fi
 info "🔄 Pulling GitHub updates..."
 git pull --ff-only origin main || fail "Git pull failed. Resolve local git changes first."
 info "📦 Installing/checking dependencies..."
