@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MyCAMate Browser Upload to Telegram
 // @namespace    local.lecture.transfer
-// @version      3.0.0
+// @version      3.1.0
 // @description  Upload authorized lecture MP4 parts from this browser to Railway for merging and Telegram delivery.
 // @match        https://foundation.badassworks.xyz/*
 // @run-at       document-idle
@@ -16,7 +16,8 @@
   const API = 'https://ubuntu-desktop-production-1c3377bc.up.railway.app';
   const VIDEO = 'video.badassworks.xyz';
   const ID = 'lecture-browser-transfer-v3';
-  const CHUNK = 2 * 1024 * 1024;
+  const CHUNK = 4 * 1024 * 1024;
+  const PARALLEL_PARTS = 3;
   if (document.getElementById(ID)) return;
   let active = false, cancel = false;
 
@@ -159,18 +160,34 @@
         GM_setValue(keyName,job);
       }
       const already=new Set(state.completed_parts||[]);
-      for(let i=0;i<count;i++){
-        if(cancel)break;
-        if(already.has(i)) {say('Already saved '+(i+1)+'/'+count);continue;}
-        if(Number(m.searchParams.get('e'))<=Date.now()/1000)
-          throw new Error('Signed link expired. Reopen the lecture and resume.');
-        const path=(i%2===0?'/p/':'/b/')+i;
-        const u=new URL(manifest);u.pathname=path;
-        say('Fetching part '+(i+1)+'/'+count);
-        const ok=await uploadPart(job,i,u.toString(),key,Number(state.offsets?.[String(i)]||0));
-        if(!ok)break;
-        say('Saved part '+(i+1)+'/'+count);
+      const pending=Array.from({length:count},(_,i)=>i).filter(i=>!already.has(i));
+      const startedAt=Date.now();
+      let next=0, uploaded=already.size, failed=null;
+      const speed=() => ((Date.now()-startedAt)/1000).toFixed(0)+'s';
+      async function worker(){
+        while(!cancel && !failed){
+          const position=next++;
+          if(position>=pending.length) return;
+          const i=pending[position];
+          try{
+            if(Number(m.searchParams.get('e'))<=Date.now()/1000)
+              throw new Error('Signed link expired. Reopen the lecture and resume.');
+            const u=new URL(manifest);
+            u.pathname=(i%2===0?'/p/':'/b/')+i;
+            say('⬇️ '+(uploaded)+'/'+count+' saved | Active workers: '+PARALLEL_PARTS);
+            const ok=await uploadPart(job,i,u.toString(),key,Number(state.offsets?.[String(i)]||0));
+            if(!ok) return;
+            uploaded++;
+            say('✅ '+uploaded+'/'+count+' parts | '+speed()+' elapsed');
+          } catch(e){
+            failed=e;
+            cancel=true;
+            return;
+          }
+        }
       }
+      await Promise.all(Array.from({length:Math.min(PARALLEL_PARTS,pending.length)},()=>worker()));
+      if(failed) throw failed;
       if(cancel) {say('Paused. Reopen lecture and click Upload Lecture to resume.');return;}
       await api('POST','/browser-jobs/'+job+'/complete',key,{});
       say('✅ All parts sent! Railway merging and Telegram uploading. Page may be closed.');
