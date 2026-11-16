@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MyCAMate Browser Upload to Telegram
 // @namespace    local.lecture.transfer
-// @version      3.2.0
+// @version      3.3.0
 // @description  Upload authorized lecture MP4 parts from this browser to Railway for merging and Telegram delivery.
 // @match        https://foundation.badassworks.xyz/*
 // @run-at       document-idle
@@ -83,6 +83,63 @@
       }).sort((a,b)=>b.startTime-a.startTime);
     return entries[0]?.name || null;
   }
+  function autoLectureTitle(metadata, lectureId) {
+    const clean = value => String(value ?? '')
+      .replace(/\\s+/g, ' ').replace(/[\\x00-\\x1f]/g, ' ').trim()
+      .replace(/\\s*[|—–-]\\s*(?:My\\s*CA\\s*Mate|CA\\s*Mate|Foundation|Badassworks)\\s*$/i, '');
+    const generic = value => !value || value.length < 4 ||
+      /^(?:CA\\s*Mate|My\\s*CA\\s*Mate|Foundation|Badassworks|Telegram|Mini App|Lecture|Player|Video)(?:\\s*[-|—–]\\s*(?:Player|Video|Lecture))?$/i.test(value) ||
+      /^[0-9]+$/.test(value);
+    const candidates = [];
+    const add = (value, score) => {
+      if (typeof value !== 'string') return;
+      const name = clean(value);
+      if (!generic(name) && name.length <= 240) candidates.push({name, score});
+    };
+
+    // A title returned by the authorized lecture manifest is best.
+    const objects = [metadata, metadata?.lecture, metadata?.video, metadata?.data];
+    for (const obj of objects) {
+      if (!obj || typeof obj !== 'object' || Array.isArray(obj)) continue;
+      for (const key of ['lecture_title','lectureTitle','video_title','videoTitle','name','title'])
+        add(obj[key], 110);
+    }
+
+    // In this Mini App the document title is sometimes only "CA Mate".
+    // Look for the active lecture heading/breadcrumb instead.
+    const selectors = [
+      '[data-lecture-title]', '[data-testid*="lecture-title"]',
+      '[class*="lectureTitle"]', '[class*="lecture-title"]',
+      '[class*="videoTitle"]', '[class*="video-title"]',
+      '[class*="lessonTitle"]', '[class*="lesson-title"]',
+      '[aria-current="page"]', 'main h1', 'main h2', 'h1', 'h2',
+      '.breadcrumb li:last-child', '[class*="breadcrumb"] [class*="active"]'
+    ];
+    for (const selector of selectors) {
+      for (const el of document.querySelectorAll(selector)) {
+        if (el.closest('#'+ID)) continue;
+        const box = el.getBoundingClientRect();
+        if (box.width <= 0 || box.height <= 0) continue;
+        add(el.getAttribute('data-lecture-title') || el.textContent, 90);
+      }
+    }
+    const metaTitle = document.querySelector('meta[property="og:title"]')?.content;
+    add(metaTitle, 45);
+    add(document.title, 35);
+    try {
+      add(new URLSearchParams(location.search).get('title'), 55);
+      add(new URLSearchParams(location.search).get('lectureName'), 55);
+    } catch {}
+    candidates.sort((a,b)=>b.score-a.score);
+    const best = candidates[0]?.name;
+    if (best) {
+      console.log('[LectureUpload] Auto title:', best, 'source score:', candidates[0].score);
+      return best.slice(0,120);
+    }
+    // Never use generic CA Mate; preserve unique ID when title unavailable.
+    return ('Lecture '+lectureId).slice(0,120);
+  }
+
   async function api(method,path,key,data) {
     const isBinary = data instanceof ArrayBuffer;
     const r = await gm({
@@ -161,13 +218,12 @@
         }
       }
       if(!job) {
-        // No repeated title prompt: use the player page title automatically.
-        const pageTitle=(document.title||'').trim();
-        const lectureTitle=pageTitle && !/^(telegram|mini app)$/i.test(pageTitle)
-          ? pageTitle+' - '+lectureId : 'Lecture '+lectureId;
+        // Prefer real lecture name from manifest or active heading.
+        const lectureTitle=autoLectureTitle(metadata,lectureId);
+        say('🎬 Detected lecture: '+lectureTitle);
         state=await api('POST','/browser-jobs',key,{
           lecture_id:lectureId,total_parts:count,
-          title:lectureTitle.slice(0,120)
+          title:lectureTitle
         });
         job=state.job_id;
         GM_setValue(keyName,job);
