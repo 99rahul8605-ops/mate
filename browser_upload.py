@@ -224,12 +224,15 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
                     raise RuntimeError("FFmpeg merge failed: " +
                                        error.decode(errors="replace")[-600:])
             metadata = await video_info(output, path, record["total_parts"])
-            # Skip custom thumbnail for now: Pyrogram standalone upload worked without it.
-            # Allow Telegram to generate the preview from the MP4.
+            # Pre-generate one stable 5-second preview for Telegram.
+            # Upload happens on the same event loop as the Pyrogram client.
+            thumb = await create_thumbnail(
+                output, path / "telegram_thumb.jpg", metadata["duration"]
+            )
             LOG.info(
                 "Video info job=%s duration=%ss resolution=%sx%s thumbnail=%s",
                 job_id, metadata["duration"], metadata["width"],
-                metadata["height"], False
+                metadata["height"], bool(thumb)
             )
             record["duration"] = metadata["duration"]
             record["width"] = metadata["width"]
@@ -279,6 +282,7 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
                 duration=metadata["duration"],
                 width=metadata["width"],
                 height=metadata["height"],
+                thumb=thumb,
                 supports_streaming=True,
                 progress=progress,
             )
