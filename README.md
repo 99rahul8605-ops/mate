@@ -86,3 +86,32 @@ active upload for that job remains. The `/complete` endpoint then retries
 using the existing parts and merged MP4. First verify the output video's
 FFprobe duration and dimensions; if Telegram still shows 00:00 after a new
 send, its playback/file content requires further investigation.
+
+
+## Automatic browser-job upload queue
+
+The browser upload now uses a **single sequential worker** (one Telegram video
+upload at a time). Finishing the last part automatically queues the job, so
+closing the browser before its final /complete request no longer leaves a
+fully uploaded lecture idle. /complete is idempotent and returns the current
+job phase (including `queued`).
+
+On API startup the worker scans on-disk `jobs/browser_uploads/*/metadata.json`
+and queues complete-but-unfinished jobs, prioritizing interrupted transfers.
+The merged `lecture_final.mp4` is reused where available. Failed or
+interrupted jobs are retried at most twice automatically; then their source
+files are kept and the job remains `failed` for manual inspection/retry.
+The API reports queue length, percentage and speed in the job status.
+
+After Telegram confirms send_video, the returned message ID and `complete`
+phase are persisted **before** deleting media. Completed jobs do not
+re-enqueue on restart. A hard crash between a successful Telegram delivery
+and receipt/persistence of its acknowledgment is fundamentally ambiguous;
+in that rare window, a recovery retry could send a duplicate video.
+Avoid restarting while a video is in flight, and verify Telegram before
+manually retrying an uncertain job.
+
+Deployment: let any active upload finish before `git pull` and restarting
+the API. Run `venv/bin/python -m py_compile server.py browser_upload.py`
+then restart as usual. Follow `server.log` for
+`Browser queue: queued`, `starting`, `retrying`, and `finished` entries.
