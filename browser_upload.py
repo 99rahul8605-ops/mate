@@ -196,23 +196,27 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
                 for i in range(record["total_parts"])
             ), encoding="utf-8")
             output = path / "lecture_final.mp4"
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error",
-                "-y", "-f", "concat", "-safe", "0", "-i", str(concat),
-                "-c", "copy", "-movflags", "+faststart", str(output),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, error = await proc.communicate()
-            if proc.returncode or not part_ok(output):
-                raise RuntimeError("FFmpeg merge failed: " +
-                                   error.decode(errors="replace")[-600:])
+            if part_ok(output):
+                LOG.info("Reusing previously merged MP4 for job=%s", job_id)
+            else:
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error",
+                    "-y", "-f", "concat", "-safe", "0", "-i", str(concat),
+                    "-c", "copy", "-movflags", "+faststart", str(output),
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, error = await proc.communicate()
+                if proc.returncode or not part_ok(output):
+                    raise RuntimeError("FFmpeg merge failed: " +
+                                       error.decode(errors="replace")[-600:])
             metadata = await video_info(output, path, record["total_parts"])
-            thumb = await create_thumbnail(output, path / "telegram_thumb.jpg", metadata["duration"])
+            # Skip custom thumbnail for now: Pyrogram standalone upload worked without it.
+            # Allow Telegram to generate the preview from the MP4.
             LOG.info(
                 "Video info job=%s duration=%ss resolution=%sx%s thumbnail=%s",
                 job_id, metadata["duration"], metadata["width"],
-                metadata["height"], bool(thumb)
+                metadata["height"], False
             )
             record["duration"] = metadata["duration"]
             record["width"] = metadata["width"]
@@ -225,17 +229,7 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
             started = time.monotonic()
             loop = asyncio.get_running_loop()
 
-            async def report_upload(done, total, elapsed):
-                pct = round(100 * done / total, 1) if total else 0.0
-                mbps = done / (1024**2) / max(elapsed, 0.001)
-                record["upload_percent"] = pct
-                record["upload_mb"] = round(done / 1024**2, 1)
-                record["upload_speed_mbps"] = round(mbps, 2)
-                save(path, record)
-                LOG.info(
-                    "Telegram upload job=%s %.1f%% %.1f/%.1f MB %.2f MB/s",
-                    job_id, pct, done / 1024**2, total / 1024**2, mbps
-                )
+            async def edit_upload_message(pct, done, total, mbps):
                 try:
                     await msg.edit_text(
                         f"📤 {record['title']}\n"
@@ -243,20 +237,28 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
                         f"{mbps:.2f} MB/s"
                     )
                 except Exception as exc:
-                    LOG.debug("Telegram progress message edit skipped: %s", exc)
+                    LOG.debug("Progress message edit skipped: %s", exc)
 
             def progress(done, total):
-                # Pyrogram calls this as a regular function; never return
-                # an unawaited coroutine to its synchronous upload pipeline.
+                # Use a synchronous callback like the known-working CLI test.
                 now = time.monotonic()
-                if now - last[0] < 5 and done < total:
+                if now - last[0] < 3 and done < total:
                     return
                 last[0] = now
-                loop.create_task(report_upload(done, total, now - started))
+                pct = round(100 * done / total, 1) if total else 0.0
+                mbps = done / (1024**2) / max(now - started, 0.001)
+                record["upload_percent"] = pct
+                record["upload_mb"] = round(done / 1024**2, 1)
+                record["upload_speed_mbps"] = round(mbps, 2)
+                save(path, record)
+                LOG.info("Telegram upload job=%s %.1f%% %.1f/%.1f MB %.2f MB/s",
+                         job_id, pct, done / 1024**2, total / 1024**2, mbps)
+                loop.create_task(edit_upload_message(pct, done, total, mbps))
 
             # Resolve the peer while the client is active, not only when
             # sending the file (fresh Pyrogram peer cache may be empty).
             await client.get_chat(chat_id)
+            LOG.info("Starting Pyrogram video send job=%s size=%.1f MB", job_id, size_mb)
             await client.send_video(
                 chat_id=chat_id,
                 video=str(output),
@@ -264,7 +266,6 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
                 duration=metadata["duration"],
                 width=metadata["width"],
                 height=metadata["height"],
-                thumb=thumb,
                 supports_streaming=True,
                 progress=progress,
             )
