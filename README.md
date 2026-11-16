@@ -46,3 +46,25 @@ Parts upload in parallel (5 workers); existing MP4 files and partial byte offset
 Old `POST /jobs` and `POST /diagnose` remain for compatibility but cannot circumvent provider IP restrictions.
 
 **Limitations:** each part must be a standalone MP4, compatible with FFmpeg concat stream-copy; live signed URLs can expire; rate limits and source rules apply; API only validates basic MP4 headers; if the browser or VPS crashes during final merge/upload, restart-recovery of that phase is not automated. Do not expose the API key, signed URLs, or Telegram WebApp auth data.
+
+
+## Telegram video metadata and thumbnail
+
+Telegram video messages now receive explicit FFprobe duration, frame width,
+frame height, and a generated JPEG preview. The browser-upload sender uses a
+synchronous Pyrogram progress callback and records upload percentage/MB/s
+in job metadata. A final MP4 with invalid stream information is rejected with
+an explanatory error instead of being posted as a broken 00:00 video.
+
+Check a previously merged file before retrying:
+
+```bash
+ffprobe -v error -show_entries format=duration:stream=codec_name,codec_type,width,height \
+  -of json /root/mate/jobs/browser_uploads/JOB_ID/lecture_final.mp4
+```
+
+This improves newly sent Telegram messages; it cannot edit the duration or
+thumbnail of a video message that has already been delivered. Re-upload a
+verified MP4 to replace the bad presentation, and remove the old message manually
+if appropriate. No retranscoding is performed by default; if the source MP4 has
+broken playback timestamps, fix/re-encode the media separately.
