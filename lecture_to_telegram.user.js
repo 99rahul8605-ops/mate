@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MyCAMate Browser Upload to Telegram
 // @namespace    local.lecture.transfer
-// @version      3.5.0
+// @version      3.6.0
 // @description  Upload authorized lecture MP4 parts from this browser to Railway for merging and Telegram delivery.
 // @match        https://foundation.badassworks.xyz/*
 // @run-at       document-idle
@@ -160,7 +160,40 @@
       }).sort((a,b)=>b.startTime-a.startTime);
     return entries[0]?.name || null;
   }
+  // The CA Mate lecture grid contains lecture numbers, not individual titles.
+  // Capture the number from the actual lecture button clicked in this iframe.
+  const SELECTED_LECTURE_KEY = 'ca_mate_selected_lecture_v1';
+  const cleanHeading = value => String(value || '').replace(/\\s+/g, ' ').trim();
+  const currentCourse = () => cleanHeading(
+    document.querySelector('.lt-back-title')?.textContent
+  );
+  function trackedLectureTitle() {
+    let info;
+    try { info = JSON.parse(sessionStorage.getItem(SELECTED_LECTURE_KEY) || 'null'); }
+    catch { return ''; }
+    const heading = currentCourse();
+    if (!info || !heading || info.course !== heading ||
+        !Number.isInteger(info.number) || info.number < 1 ||
+        Date.now() - info.at > 12 * 60 * 60 * 1000) return '';
+    const sections = heading.split(/\\s*[›>]\\s*/).map(v => v.trim()).filter(Boolean);
+    const name = [...sections, 'Lecture ' + String(info.number).padStart(2, '0')].join(' | ');
+    return name.slice(0, 120);
+  }
+  document.addEventListener('click', event => {
+    const btn = event.target.closest?.('.lt-lec');
+    if (!btn || !document.contains(btn)) return;
+    const num = Number(btn.querySelector('.lt-lec-num')?.textContent?.trim());
+    const course = currentCourse();
+    if (!Number.isInteger(num) || num < 1 || !course) return;
+    sessionStorage.setItem(SELECTED_LECTURE_KEY,
+      JSON.stringify({course, number:num, at:Date.now()}));
+    console.log('[LectureUpload] Selected', course, 'Lecture', num);
+    say('🎬 Selected: '+trackedLectureTitle());
+  }, true);
+
   function autoLectureTitle(metadata, lectureId) {
+    const selected = trackedLectureTitle();
+    if (selected) return selected;
     const clean = value => String(value ?? '')
       .replace(/\s+/g, ' ').replace(/[\x00-\x1f]/g, ' ').trim()
       .replace(/\s*[|—–-]\s*(?:My\s*CA\s*Mate|CA\s*Mate|Foundation|Badassworks)\s*$/i, '');
