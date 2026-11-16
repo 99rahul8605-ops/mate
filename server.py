@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
 from pyrogram import Client, filters, utils as pyrogram_utils
+from pyrogram.handlers import MessageHandler
 
 # Pyrogram 2.0.106's channel-ID lower bound predates newer Telegram
 # supergroup/channel IDs (e.g. -1003697529293). Its get_peer_type()
@@ -60,14 +61,19 @@ if not all((
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-client = Client(
-    "bot_session_pyrogram",
-    api_id=TG_API_ID,
-    api_hash=TG_API_HASH,
-    bot_token=TG_BOT_TOKEN,
-    workdir=str(DATA_DIR),
-    workers=4,
-)
+class RuntimeTelegramClient:
+    """Proxy shared with API routes; construct Pyrogram inside Uvicorn's event loop."""
+
+    def __init__(self):
+        self.instance = None
+
+    def __getattr__(self, name):
+        if self.instance is None:
+            raise RuntimeError("Telegram client has not started")
+        return getattr(self.instance, name)
+
+
+client = RuntimeTelegramClient()
 
 queue = asyncio.Queue()
 records = {}
@@ -601,7 +607,6 @@ async def worker():
             queue.task_done()
 
 
-@client.on_message(filters.command("start"))
 async def start_message(_client, message):
     await message.reply_text(
         "Lecture receiver online.\n"
@@ -613,22 +618,35 @@ async def start_message(_client, message):
 async def lifespan(app):
     global worker_task
 
+    # IMPORTANT: Pyrogram captures the current loop in Client.__init__.
+    # Constructing Client at module import binds it to a different loop
+    # from Uvicorn's lifespan/background tasks, causing
+    # "Future attached to a different loop" on large uploads.
+    client.instance = Client(
+        "bot_session_pyrogram",
+        api_id=TG_API_ID,
+        api_hash=TG_API_HASH,
+        bot_token=TG_BOT_TOKEN,
+        workdir=str(DATA_DIR),
+        workers=4,
+    )
+    client.instance.add_handler(
+        MessageHandler(start_message, filters.command("start"))
+    )
     await client.start()
 
-    worker_task = asyncio.create_task(
-        worker()
-    )
-
-    yield
-
-    worker_task.cancel()
+    worker_task = asyncio.create_task(worker())
 
     try:
-        await worker_task
-    except asyncio.CancelledError:
-        pass
-
-    await client.stop()
+        yield
+    finally:
+        worker_task.cancel()
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass
+        await client.stop()
+        client.instance = None
 
 
 app = FastAPI(
