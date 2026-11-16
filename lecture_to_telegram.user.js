@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MyCAMate Browser Upload to Telegram
 // @namespace    local.lecture.transfer
-// @version      3.3.0
+// @version      3.4.0
 // @description  Upload authorized lecture MP4 parts from this browser to Railway for merging and Telegram delivery.
 // @match        https://foundation.badassworks.xyz/*
 // @run-at       document-idle
@@ -18,6 +18,7 @@
   const ID = 'lecture-browser-transfer-v3';
   const CHUNK = 10 * 1024 * 1024;
   const PARALLEL_PARTS = 5;
+  const SAVED_JOBS = 'lecture_upload_queue_v1';
   if (document.getElementById(ID)) return;
   let active = false, cancel = false;
 
@@ -39,14 +40,18 @@
   settings.textContent = '⚙ API Key';
   const stop = document.createElement('button');
   stop.textContent = '⏸ Pause';
+  const queuedButton = document.createElement('button');
+  queuedButton.textContent = '📋 Queue';
+  const queueStatus = document.createElement('div');
+  queueStatus.style.cssText = 'font-size:11px;margin-top:7px;max-height:130px;overflow:auto;white-space:pre-line;color:#cbd5e1';
   const status = document.createElement('div');
   status.textContent = 'Play lecture, then upload.';
   status.style.cssText = 'font-size:11px;margin-top:9px;overflow-wrap:anywhere;line-height:1.4';
-  for (const b of [send,settings,stop]) {
+  for (const b of [send,settings,stop,queuedButton]) {
     b.style.cssText = 'cursor:pointer;border:0;border-radius:7px;padding:8px;margin:3px 2px;background:#2563eb;color:white;font-size:12px';
   }
   stop.style.background = '#475569';
-  root.append(title,send,settings,stop,status);
+  root.append(title,send,settings,stop,queuedButton,status,queueStatus);
   (document.body || document.documentElement).appendChild(root);
   const say = value => {status.textContent = value;console.log('[LectureUpload]',value);};
   function getSavedKey() {
@@ -56,6 +61,70 @@
   }
   if (getSavedKey()) settings.textContent = '⚙ Key saved';
 
+  function storedJobs() {
+    const value = GM_getValue(SAVED_JOBS, []);
+    return Array.isArray(value) ? value.filter(j => j && j.id) : [];
+  }
+  function rememberJob(id, name, lectureId) {
+    const jobs = storedJobs().filter(j => j.id !== id);
+    jobs.unshift({id, name, lectureId, phase:'receiving', updated:Date.now()});
+    GM_setValue(SAVED_JOBS, jobs.slice(0, 30));
+  }
+  function updateStoredJob(id, changes) {
+    const jobs = storedJobs();
+    const j = jobs.find(j => j.id === id);
+    if (j) {
+      Object.assign(j, changes, {updated:Date.now()});
+      GM_setValue(SAVED_JOBS, jobs);
+    }
+  }
+  function showQueue() {
+    const jobs = storedJobs();
+    const live = jobs.filter(j => !['complete'].includes(j.phase));
+    if (!jobs.length) {
+      queueStatus.textContent = 'Queue: empty';
+      return;
+    }
+    const names = live.slice(0, 5).map(j => {
+      const state = j.phase === 'queued' ? '⏳' :
+        j.phase === 'uploading' ? '📤' :
+        j.phase === 'merging' ? '🔧' :
+        j.phase === 'failed' ? '⚠️' : '⬇️';
+      const pct = j.phase === 'uploading' && Number.isFinite(j.percent)
+        ? ' '+j.percent+'%' : '';
+      return state+' '+j.name.slice(0,38)+' ('+j.phase+pct+')';
+    });
+    queueStatus.textContent =
+      'Pending: '+live.length+' | Delivered: '+jobs.filter(j=>j.phase==='complete').length+
+      (names.length ? '\\n'+names.join('\\n') : '');
+  }
+  let queueRefreshing = false;
+  async function refreshQueue() {
+    if (queueRefreshing || active) return;
+    const key = getSavedKey();
+    if (!key) {showQueue();return;}
+    queueRefreshing = true;
+    try {
+      for (const job of storedJobs().slice(0,15)) {
+        if (job.phase === 'complete') continue;
+        try {
+          const state = await api('GET','/browser-jobs/'+job.id,key);
+          updateStoredJob(job.id, {
+            phase:state.phase, name:state.title||job.name,
+            percent:Number(state.upload_percent)||0
+          });
+        } catch(e) {
+          console.warn('[LectureUpload] Queue status unavailable:',job.id,e.message);
+        }
+      }
+    } finally {
+      queueRefreshing = false;
+      showQueue();
+    }
+  }
+  queuedButton.onclick=()=>refreshQueue();
+  showQueue();
+  setInterval(()=>{if(!active && !document.hidden) refreshQueue();},20000);
   function gm({url,method='GET',headers={},data,responseType='text',timeout=180000}) {
     return new Promise((resolve,reject) => GM_xmlhttpRequest({
       url, method, headers, data, responseType, timeout,
@@ -207,10 +276,15 @@
       if(job){
         try {
           state=await api('GET','/browser-jobs/'+job,key);
-          if(state.total_parts!==count || state.phase==='complete') {
+          if(state.total_parts!==count) {
             job='';state=null;
+          } else if(['queued','merging','uploading','complete'].includes(state.phase)) {
+            updateStoredJob(job, {phase:state.phase, name:state.title||'Lecture '+lectureId});
+            showQueue();
+            say('✅ This lecture is already '+state.phase+'. Open the NEXT lecture and press Upload Lecture.');
+            return;
           } else if(!['receiving','failed'].includes(state.phase)) {
-            throw new Error('Job already '+state.phase+'. Check Telegram.');
+            throw new Error('Unexpected job state: '+state.phase);
           }
         } catch(e) {
           if(String(e.message).includes('HTTP 404')) {job='';state=null;}
@@ -227,7 +301,11 @@
         });
         job=state.job_id;
         GM_setValue(keyName,job);
+        rememberJob(job,lectureTitle,lectureId);
+        showQueue();
       }
+      if(!storedJobs().some(j=>j.id===job))
+        rememberJob(job,state.title||'Lecture '+lectureId,lectureId);
       const already=new Set(state.completed_parts||[]);
       const pending=Array.from({length:count},(_,i)=>i).filter(i=>!already.has(i));
       const startedAt=Date.now();
@@ -258,14 +336,17 @@
       await Promise.all(Array.from({length:Math.min(PARALLEL_PARTS,pending.length)},()=>worker()));
       if(failed) throw failed;
       if(cancel) {say('Paused. Reopen lecture and click Upload Lecture to resume.');return;}
-      await api('POST','/browser-jobs/'+job+'/complete',key,{});
-      say('✅ All parts sent! Railway merging and Telegram uploading. Page may be closed.');
-      alert('All parts uploaded. VPS will merge and send to Telegram.');
+      // /complete only queues the job; it never waits for Telegram delivery.
+      const queued = await api('POST','/browser-jobs/'+job+'/complete',key,{});
+      updateStoredJob(job,{phase:queued.phase,percent:0});
+      showQueue();
+      say('✅ Saved on VPS and queued for Telegram! Open the NEXT lecture now and press Upload Lecture. No need to wait for Telegram.');
     } catch(e) {
       say('❌ '+e.message);
-      alert('Lecture upload stopped: '+e.message);
+      alert('Lecture transfer stopped: '+e.message);
     } finally {
       active=false;send.disabled=false;
+      showQueue();
     }
   };
 })();
