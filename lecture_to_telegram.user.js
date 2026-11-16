@@ -96,7 +96,7 @@
     });
     queueStatus.textContent =
       'Pending: '+live.length+' | Delivered: '+jobs.filter(j=>j.phase==='complete').length+
-      (names.length ? '\\n'+names.join('\\n') : '');
+      (names.length ? '\n'+names.join('\n') : '');
   }
   let queueRefreshing = false;
   async function refreshQueue() {
@@ -154,10 +154,10 @@
   }
   function autoLectureTitle(metadata, lectureId) {
     const clean = value => String(value ?? '')
-      .replace(/\\s+/g, ' ').replace(/[\\x00-\\x1f]/g, ' ').trim()
-      .replace(/\\s*[|—–-]\\s*(?:My\\s*CA\\s*Mate|CA\\s*Mate|Foundation|Badassworks)\\s*$/i, '');
+      .replace(/\s+/g, ' ').replace(/[\x00-\x1f]/g, ' ').trim()
+      .replace(/\s*[|—–-]\s*(?:My\s*CA\s*Mate|CA\s*Mate|Foundation|Badassworks)\s*$/i, '');
     const generic = value => !value || value.length < 4 ||
-      /^(?:CA\\s*Mate|My\\s*CA\\s*Mate|Foundation|Badassworks|Telegram|Mini App|Lecture|Player|Video)(?:\\s*[-|—–]\\s*(?:Player|Video|Lecture))?$/i.test(value) ||
+      /^(?:CA\s*Mate|My\s*CA\s*Mate|Foundation|Badassworks|Telegram|Mini App|Lecture|Player|Video)(?:\s*[-|—–]\s*(?:Player|Video|Lecture))?$/i.test(value) ||
       /^[0-9]+$/.test(value);
     const candidates = [];
     const add = (value, score) => {
