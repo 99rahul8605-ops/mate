@@ -79,14 +79,15 @@ async def video_info(path, part_dir=None, part_count=0):
 async def create_thumbnail(video, destination, duration):
     video = Path(video)
     destination = Path(destination)
-    # Avoid blindly picking the first frame, often a splash or black frame.
-    seek = min(max(float(duration) * 0.12, 1.0), 90.0)
-    for position in (seek, 1.0, 0.0):
+    # Prefer a frame 5 seconds into the lecture, not its opening splash.
+    # For clips shorter than 5 seconds, take a frame around the middle.
+    seek = 5.0 if duration > 5.5 else max(0.0, duration / 2)
+    for position in (seek, max(0.0, seek - 1.0), 0.0):
         destination.unlink(missing_ok=True)
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
             "-y", "-ss", str(position), "-i", str(video),
-            "-frames:v", "1", "-vf", "scale=320:-2",
+            "-frames:v", "1", "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
             "-q:v", "5", str(destination),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
