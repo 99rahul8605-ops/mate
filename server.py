@@ -635,6 +635,8 @@ async def lifespan(app):
     )
     await client.start()
 
+    await browser_upload_startup()
+
     worker_task = asyncio.create_task(worker())
 
     try:
@@ -645,6 +647,7 @@ async def lifespan(app):
             await worker_task
         except asyncio.CancelledError:
             pass
+        await browser_upload_shutdown()
         await client.stop()
         client.instance = None
 
@@ -654,7 +657,9 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-setup_browser_upload(app, client, API_KEY, TG_CHAT_ID, DATA_DIR, MAX_PARTS, MAX_TOTAL_GB)
+browser_upload_startup, browser_upload_shutdown = setup_browser_upload(
+    app, client, API_KEY, TG_CHAT_ID, DATA_DIR, MAX_PARTS, MAX_TOTAL_GB
+)
 
 
 @app.get("/health")
