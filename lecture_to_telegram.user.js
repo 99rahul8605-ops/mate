@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MyCAMate Browser Upload to Telegram
 // @namespace    local.lecture.transfer
-// @version      3.1.0
+// @version      3.2.0
 // @description  Upload authorized lecture MP4 parts from this browser to Railway for merging and Telegram delivery.
 // @match        https://foundation.badassworks.xyz/*
 // @run-at       document-idle
@@ -16,8 +16,8 @@
   const API = 'https://ubuntu-desktop-production-1c3377bc.up.railway.app';
   const VIDEO = 'video.badassworks.xyz';
   const ID = 'lecture-browser-transfer-v3';
-  const CHUNK = 4 * 1024 * 1024;
-  const PARALLEL_PARTS = 3;
+  const CHUNK = 10 * 1024 * 1024;
+  const PARALLEL_PARTS = 5;
   if (document.getElementById(ID)) return;
   let active = false, cancel = false;
 
@@ -49,6 +49,12 @@
   root.append(title,send,settings,stop,status);
   (document.body || document.documentElement).appendChild(root);
   const say = value => {status.textContent = value;console.log('[LectureUpload]',value);};
+  function getSavedKey() {
+    const saved = GM_getValue('browser_api_key', '') || GM_getValue('api_key', '');
+    if (saved) GM_setValue('browser_api_key', saved);
+    return saved;
+  }
+  if (getSavedKey()) settings.textContent = '⚙ Key saved';
 
   function gm({url,method='GET',headers={},data,responseType='text',timeout=180000}) {
     return new Promise((resolve,reject) => GM_xmlhttpRequest({
@@ -88,9 +94,13 @@
     return JSON.parse(r.responseText);
   }
   settings.onclick=()=>{
-    const previous=GM_getValue('browser_api_key','');
-    const key=prompt(previous?'New API key (blank keeps saved key):':'VPS API_KEY:');
-    if(key?.trim()) {GM_setValue('browser_api_key',key.trim());say('API key saved locally');}
+    const previous=getSavedKey();
+    const key=prompt(previous?'Replace saved API key (Cancel keeps it):':'VPS API_KEY (saved for future uploads):');
+    if(key?.trim()) {
+      GM_setValue('browser_api_key',key.trim());
+      settings.textContent = '⚙ Key saved';
+      say('API key saved in Tampermonkey for future uploads');
+    }
   };
   stop.onclick=()=>{cancel=true;say('Pausing after current request. Resume by clicking Upload Lecture.');};
   async function uploadPart(job, i, u, key, knownOffset=0) {
@@ -118,11 +128,12 @@
     if(active)return;
     cancel=false;active=true;send.disabled=true;
     try {
-      let key=GM_getValue('browser_api_key','');
+      let key=getSavedKey();
       if(!key) {
         key=prompt('VPS API_KEY:')?.trim();
         if(!key) return;
         GM_setValue('browser_api_key',key);
+        settings.textContent = '⚙ Key saved';
       }
       const manifest=manifestURL();
       if(!manifest) throw new Error('Fresh /m URL not found. Play the lecture first.');
@@ -150,11 +161,13 @@
         }
       }
       if(!job) {
-        const lectureTitle=prompt('Lecture title:',document.title||'Lecture');
-        if(lectureTitle===null)return;
+        // No repeated title prompt: use the player page title automatically.
+        const pageTitle=(document.title||'').trim();
+        const lectureTitle=pageTitle && !/^(telegram|mini app)$/i.test(pageTitle)
+          ? pageTitle+' - '+lectureId : 'Lecture '+lectureId;
         state=await api('POST','/browser-jobs',key,{
           lecture_id:lectureId,total_parts:count,
-          title:lectureTitle.trim()||'Lecture'
+          title:lectureTitle.slice(0,120)
         });
         job=state.job_id;
         GM_setValue(keyName,job);
