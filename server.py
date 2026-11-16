@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
 from telethon import TelegramClient, events
+from browser_upload import setup_browser_upload
 
 load_dotenv()
 
@@ -619,6 +620,8 @@ app = FastAPI(
     title="Lecture to Telegram",
     lifespan=lifespan
 )
+
+setup_browser_upload(app, client, API_KEY, TG_CHAT_ID, DATA_DIR, MAX_PARTS, MAX_TOTAL_GB)
 
 
 @app.get("/health")
