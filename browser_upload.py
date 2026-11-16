@@ -36,6 +36,10 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
     root.mkdir(parents=True, exist_ok=True)
     locks = {}
     active = {}
+    pending = set()
+    job_queue = asyncio.Queue()
+    queue_worker = None
+    max_auto_retries = 2
     max_bytes = int(max_total_gb * 1024**3)
 
     def auth(key):
@@ -101,6 +105,9 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
             "completed_parts": complete,
             "offsets": offsets,
             "upload_percent": record.get("upload_percent", 0),
+            "queue_position": job_queue.qsize() if record.get("phase") == "queued" else None,
+            "upload_speed_mbps": record.get("upload_speed_mbps", 0),
+            "telegram_message_id": record.get("telegram_message_id"),
         }
 
     @router.post("", status_code=201)
@@ -259,7 +266,7 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
             # sending the file (fresh Pyrogram peer cache may be empty).
             await client.get_chat(chat_id)
             LOG.info("Starting Pyrogram video send job=%s size=%.1f MB", job_id, size_mb)
-            await client.send_video(
+            sent = await client.send_video(
                 chat_id=chat_id,
                 video=str(output),
                 caption=f"🎬 {record['title']}",
@@ -269,16 +276,24 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
                 supports_streaming=True,
                 progress=progress,
             )
+            record["telegram_message_id"] = sent.id
+            record["upload_percent"] = 100
             record["phase"] = "complete"
             record["detail"] = f"Sent {size_mb:.1f} MB to Telegram"
             save(path, record)
-            await msg.edit_text(f"✅ Sent: {record['title']} ({size_mb:.1f} MB)")
-            # Keep metadata for status checks; remove only large media.
-            for f in path.glob("part_*"):
-                f.unlink(missing_ok=True)
-            output.unlink(missing_ok=True)
-            concat.unlink(missing_ok=True)
-            (path / "telegram_thumb.jpg").unlink(missing_ok=True)
+            # Delivery is already durable here; cosmetic failures must not resend it.
+            try:
+                await msg.edit_text(f"✅ Sent: {record['title']} ({size_mb:.1f} MB)")
+            except Exception as exc:
+                LOG.warning("Post-send edit failed for %s: %s", job_id, exc)
+            try:
+                for f in path.glob("part_*"):
+                    f.unlink(missing_ok=True)
+                output.unlink(missing_ok=True)
+                concat.unlink(missing_ok=True)
+                (path / "telegram_thumb.jpg").unlink(missing_ok=True)
+            except OSError as exc:
+                LOG.warning("Post-send media cleanup failed for %s: %s", job_id, exc)
         except Exception as exc:
             LOG.exception("Browser upload job %s failed", job_id)
             record["phase"] = "failed"
@@ -292,22 +307,129 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
         finally:
             active.pop(job_id, None)
 
+    def is_ready(path, record):
+        output = path / "lecture_final.mp4"
+        if part_ok(output):
+            return True
+        complete_parts, _ = part_state(path, record)
+        return len(complete_parts) == record["total_parts"]
+
+    def enqueue(path, record):
+        jid = record["id"]
+        if jid in pending or jid in active:
+            return False
+        if record["phase"] == "complete":
+            return False
+        record["phase"] = "queued"
+        record["detail"] = "Waiting for sequential Telegram upload"
+        record["upload_percent"] = 0
+        save(path, record)
+        pending.add(jid)
+        job_queue.put_nowait(jid)
+        LOG.info("Browser queue: queued job=%s pending=%s", jid, job_queue.qsize())
+        return True
+
+    async def run_queue():
+        while True:
+            jid = await job_queue.get()
+            pending.discard(jid)
+            try:
+                path, record = load(jid)
+                if record["phase"] == "complete":
+                    continue
+                if not is_ready(path, record):
+                    record["phase"] = "failed"
+                    record["detail"] = "Not all media parts are present"
+                    save(path, record)
+                    continue
+                record["phase"] = "merging"
+                record["detail"] = ""
+                save(path, record)
+                LOG.info("Browser queue: starting job=%s", jid)
+                active[jid] = asyncio.current_task()
+                try:
+                    await finalize(jid)
+                finally:
+                    active.pop(jid, None)
+                _, result = load(jid)
+                if result["phase"] == "failed":
+                    attempts = int(result.get("auto_retry_count", 0))
+                    if attempts < max_auto_retries:
+                        result["auto_retry_count"] = attempts + 1
+                        save(path, result)
+                        LOG.warning(
+                            "Browser queue: retrying failed job=%s attempt=%s/%s",
+                            jid, attempts + 1, max_auto_retries
+                        )
+                        enqueue(path, result)
+                else:
+                    LOG.info("Browser queue: finished job=%s phase=%s",
+                             jid, result["phase"])
+            except asyncio.CancelledError:
+                LOG.warning("Browser queue worker stopped; unfinished job=%s "
+                            "will be recovered on startup", jid)
+                raise
+            except Exception:
+                LOG.exception("Browser queue: unexpected failure job=%s", jid)
+            finally:
+                job_queue.task_done()
+
+    async def startup():
+        nonlocal queue_worker
+        if queue_worker and not queue_worker.done():
+            return
+        queue_worker = asyncio.create_task(run_queue(), name="browser-upload-queue")
+        recovered = []
+        for meta in root.glob("*/metadata.json"):
+            try:
+                path = meta.parent
+                record = json.loads(meta.read_text("utf-8"))
+                phase = record.get("phase")
+                if phase in ("complete", "receiving"):
+                    continue
+                if phase == "failed":
+                    if int(record.get("auto_retry_count", 0)) >= max_auto_retries:
+                        continue
+                elif phase not in ("queued", "merging", "uploading"):
+                    continue
+                if not is_ready(path, record):
+                    continue
+                recovered.append((phase not in ("uploading", "merging"),
+                                  record.get("updated", ""), path, record))
+            except Exception:
+                LOG.exception("Browser queue: cannot recover %s", meta)
+        recovered.sort(key=lambda x: (x[0], x[1]))
+        for _, _, path, record in recovered:
+            if record["phase"] == "failed":
+                record["auto_retry_count"] = int(record.get("auto_retry_count", 0)) + 1
+            enqueue(path, record)
+        LOG.info("Browser queue started: %s recovered jobs", len(recovered))
+
+    async def shutdown():
+        nonlocal queue_worker
+        if queue_worker:
+            queue_worker.cancel()
+            try:
+                await queue_worker
+            except asyncio.CancelledError:
+                pass
+            queue_worker = None
+
     @router.post("/{job_id}/complete", status_code=202)
     async def complete(job_id: str, x_api_key: str | None = Header(default=None)):
         auth(x_api_key)
         async with locks.setdefault(job_id, asyncio.Lock()):
             path, record = load(job_id)
-            if record["phase"] in ("merging", "uploading", "complete"):
+            if record["phase"] in ("queued", "merging", "uploading", "complete"):
                 return public(path, record)
-            complete_parts, _ = part_state(path, record)
-            if len(complete_parts) != record["total_parts"]:
+            if not is_ready(path, record):
+                complete_parts, _ = part_state(path, record)
                 raise HTTPException(status_code=409, detail=(
                     f"Only {len(complete_parts)}/{record['total_parts']} parts uploaded"
                 ))
-            record["phase"] = "merging"
-            record["detail"] = ""
-            save(path, record)
-            active[job_id] = asyncio.create_task(finalize(job_id))
+            record["auto_retry_count"] = 0
+            enqueue(path, record)
             return public(path, record)
 
     app.include_router(router)
+    return startup, shutdown
