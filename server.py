@@ -515,7 +515,7 @@ async def process(job):
         )
 
         metadata = await video_info(output, root, len(parts))
-        thumb = await create_thumbnail(output, root / "telegram_thumb.jpg", metadata["duration"])
+        # Let Telegram generate the preview; standalone Pyrogram send works without a custom thumb.
         LOG.info(
             "Video metadata: %ss %sx%s",
             metadata["duration"], metadata["width"], metadata["height"]
@@ -524,23 +524,20 @@ async def process(job):
         started = time.monotonic()
         loop = asyncio.get_running_loop()
 
-        async def report_progress(current, total, elapsed):
+        def upload_progress(current, total):
+            now = time.monotonic()
+            if now - upload_state["last"] < 3 and current < total:
+                return
+            upload_state["last"] = now
             job["upload_percent"] = round(current * 100 / total, 1) if total else 0
-            speed = current / (1024**2) / max(elapsed, 0.001)
+            speed = current / (1024**2) / max(now - started, 0.001)
             LOG.info("Telegram upload job=%s %.1f%% speed=%.2f MB/s",
                      job["id"], job["upload_percent"], speed)
-            await send_progress(
+            loop.create_task(send_progress(
                 msg,
                 f"📤 {job['title']} | {job['upload_percent']}% | {speed:.2f} MB/s",
                 last_edit
-            )
-
-        def upload_progress(current, total):
-            now = time.monotonic()
-            if now - upload_state["last"] < 5 and current < total:
-                return
-            upload_state["last"] = now
-            loop.create_task(report_progress(current, total, now - started))
+            ))
 
         await client.get_chat(TG_CHAT_ID)
         await client.send_video(
@@ -550,7 +547,6 @@ async def process(job):
             duration=metadata["duration"],
             width=metadata["width"],
             height=metadata["height"],
-            thumb=thumb,
             supports_streaming=True,
             progress=upload_progress
         )
