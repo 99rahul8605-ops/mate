@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MyCAMate Browser Upload to Telegram
 // @namespace    local.lecture.transfer
-// @version      3.6.0
+// @version      3.7.0
 // @description  Upload authorized lecture MP4 parts from this browser to Railway for merging and Telegram delivery.
 // @match        https://foundation.badassworks.xyz/*
 // @run-at       document-idle
@@ -163,10 +163,36 @@
   // The CA Mate lecture grid contains lecture numbers, not individual titles.
   // Capture the number from the actual lecture button clicked in this iframe.
   const SELECTED_LECTURE_KEY = 'ca_mate_selected_lecture_v1';
-  const cleanHeading = value => String(value || '').replace(/\\s+/g, ' ').trim();
+  const cleanHeading = value => String(value || '').replace(/\s+/g, ' ').trim();
   const currentCourse = () => cleanHeading(
     document.querySelector('.lt-back-title')?.textContent
   );
+  const SELECTED_CHAPTER_KEY = 'ca_mate_selected_chapter_v1';
+  function trackedChapterName(course) {
+    let saved;
+    try { saved = JSON.parse(sessionStorage.getItem(SELECTED_CHAPTER_KEY) || 'null'); }
+    catch { return ''; }
+    return saved && saved.course === course && typeof saved.name === 'string' &&
+      Date.now() - saved.at < 12 * 60 * 60 * 1000 ? saved.name : '';
+  }
+  // Capture the chapter on the chapter-list screen BEFORE CA Mate opens the lecture grid.
+  // Ignore Notes actions; only entering lectures updates the selected chapter.
+  document.addEventListener('click', event => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const chapterCard = target.closest('.lt-ch');
+    if (!chapterCard) return;
+    const action = target.closest('.lt-act');
+    if (action && !/^lectures$/i.test(action.textContent.trim())) return;
+    const name = cleanHeading(chapterCard.querySelector('.lt-ch-name')?.textContent);
+    const course = currentCourse();
+    if (!name || !course) return;
+    sessionStorage.setItem(SELECTED_CHAPTER_KEY,
+      JSON.stringify({course, name, at:Date.now()}));
+    sessionStorage.removeItem(SELECTED_LECTURE_KEY);
+    console.log('[LectureUpload] Chapter selected:', name);
+    say('📚 Chapter: '+name+'. Select a lecture number.');
+  }, true);
   function trackedLectureTitle() {
     let info;
     try { info = JSON.parse(sessionStorage.getItem(SELECTED_LECTURE_KEY) || 'null'); }
@@ -175,8 +201,10 @@
     if (!info || !heading || info.course !== heading ||
         !Number.isInteger(info.number) || info.number < 1 ||
         Date.now() - info.at > 12 * 60 * 60 * 1000) return '';
-    const sections = heading.split(/\\s*[›>]\\s*/).map(v => v.trim()).filter(Boolean);
-    const name = [...sections, 'Lecture ' + String(info.number).padStart(2, '0')].join(' | ');
+    const sections = heading.split(/\s*[›>]\s*/).map(v => v.trim()).filter(Boolean);
+    const chapter = trackedChapterName(heading);
+    const name = [...sections, ...(chapter ? [chapter] : []),
+      'Lecture ' + String(info.number).padStart(2, '0')].join(' | ');
     return name.slice(0, 120);
   }
   document.addEventListener('click', event => {
