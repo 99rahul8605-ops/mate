@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MyCAMate Browser Upload to Telegram
 // @namespace    local.lecture.transfer
-// @version      3.7.0
+// @version      3.8.0
 // @description  Upload authorized lecture MP4 parts from this browser to Railway for merging and Telegram delivery.
 // @match        https://foundation.badassworks.xyz/*
 // @run-at       document-idle
@@ -148,17 +148,57 @@
       onabort:()=>reject(new Error('Request aborted'))
     }));
   }
+  // Collect signed video requests even when Chrome evicts Resource Timing entries.
+  // A playing video may request /p/0 or /b/1 without a new /m request.
+  let lastLectureClickAt = 0;
+  const recentVideoRequests = [];
+  function captureVideoRequest(name, startedAt) {
+    try {
+      const u = new URL(name);
+      if (u.hostname !== VIDEO ||
+          !/^\\/(?:m|[pb]\\/\\d+)$/.test(u.pathname) ||
+          !['l','e','s'].every(k => u.searchParams.has(k))) return;
+      const when = Number(startedAt) || performance.now();
+      if (!recentVideoRequests.some(r => r.name === name && Math.abs(r.at - when) < 100))
+        recentVideoRequests.push({name, at:when});
+      if (recentVideoRequests.length > 100) recentVideoRequests.splice(0, recentVideoRequests.length - 100);
+    } catch {}
+  }
+  try {
+    new PerformanceObserver(list => {
+      for (const entry of list.getEntries()) captureVideoRequest(entry.name, entry.startTime);
+    }).observe({type:'resource', buffered:true});
+  } catch {}
   function manifestURL() {
-    const entries = performance.getEntriesByType('resource')
-      .filter(e => {
-        try {
-          const u = new URL(e.name);
-          return u.hostname === VIDEO && u.pathname === '/m' &&
-            ['l','e','s'].every(k=>u.searchParams.has(k)) &&
-            Number(u.searchParams.get('e')) > Date.now()/1000;
-        } catch {return false;}
-      }).sort((a,b)=>b.startTime-a.startTime);
-    return entries[0]?.name || null;
+    for (const entry of performance.getEntriesByType('resource'))
+      captureVideoRequest(entry.name, entry.startTime);
+    const now = Date.now() / 1000;
+    const candidates = recentVideoRequests.filter(item => {
+      try {
+        const url = new URL(item.name);
+        return Number(url.searchParams.get('e')) > now + 30 &&
+          (!lastLectureClickAt || item.at >= lastLectureClickAt - 1000);
+      } catch { return false; }
+    }).sort((a,b) => b.at - a.at);
+    if (!candidates.length) return null;
+    // Pick the most recently requested lecture, but prefer its real manifest
+    // to an inferred /m URL when both are present.
+    const latestId = new URL(candidates[0].name).searchParams.get('l');
+    const matching = candidates.filter(item =>
+      new URL(item.name).searchParams.get('l') === latestId
+    );
+    const source = matching.find(item => new URL(item.name).pathname === '/m') || matching[0];
+    const manifest = new URL(source.name);
+    manifest.pathname = '/m';
+    return manifest.href;
+  }
+  async function waitForManifest() {
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const manifest = manifestURL();
+      if (manifest) return manifest;
+      if (attempt < 9) await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    return null;
   }
   // The CA Mate lecture grid contains lecture numbers, not individual titles.
   // Capture the number from the actual lecture button clicked in this iframe.
@@ -210,6 +250,7 @@
   document.addEventListener('click', event => {
     const btn = event.target.closest?.('.lt-lec');
     if (!btn || !document.contains(btn)) return;
+    lastLectureClickAt = performance.now();
     const num = Number(btn.querySelector('.lt-lec-num')?.textContent?.trim());
     const course = currentCourse();
     if (!Number.isInteger(num) || num < 1 || !course) return;
@@ -346,8 +387,8 @@
         GM_setValue('browser_api_key',key);
         settings.textContent = '⚙ Key saved';
       }
-      const manifest=manifestURL();
-      if(!manifest) throw new Error('Fresh /m URL not found. Play the lecture first.');
+      const manifest=await waitForManifest();
+      if(!manifest) throw new Error('No fresh signed video request detected. Close player, reopen the lecture and press Play, then retry. Offline-only playback may not request a manifest.');
       const m=new URL(manifest);
       const lectureId=m.searchParams.get('l');
       const response=await gm({url:manifest,responseType:'text'});
