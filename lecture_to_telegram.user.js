@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MyCAMate Browser Upload to Telegram
 // @namespace    local.lecture.transfer
-// @version      3.8.0
+// @version      3.8.1
 // @description  Upload authorized lecture MP4 parts from this browser to Railway for merging and Telegram delivery.
 // @match        https://foundation.badassworks.xyz/*
 // @run-at       document-idle
@@ -155,8 +155,10 @@
   function captureVideoRequest(name, startedAt) {
     try {
       const u = new URL(name);
-      if (u.hostname !== VIDEO ||
-          !/^\\/(?:m|[pb]\\/\\d+)$/.test(u.pathname) ||
+      const isPart = u.pathname.startsWith('/p/') || u.pathname.startsWith('/b/');
+      const validPart = isPart && Number.isInteger(Number(u.pathname.slice(3))) &&
+        Number(u.pathname.slice(3)) >= 0;
+      if (u.hostname !== VIDEO || !(u.pathname === '/m' || validPart) ||
           !['l','e','s'].every(k => u.searchParams.has(k))) return;
       const when = Number(startedAt) || performance.now();
       if (!recentVideoRequests.some(r => r.name === name && Math.abs(r.at - when) < 100))
