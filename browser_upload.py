@@ -39,6 +39,9 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
     pending = set()
     job_queue = asyncio.Queue()
     queue_worker = None
+    cleanup_worker = None
+    cleanup_after_seconds = 24 * 60 * 60
+    cleanup_interval_seconds = 60 * 60
     max_auto_retries = 2
     max_bytes = int(max_total_gb * 1024**3)
 
@@ -384,8 +387,68 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
             finally:
                 job_queue.task_done()
 
+    async def cleanup_stale_jobs():
+        """Remove only jobs inactive for 24 hours, without disturbing live transfers."""
+        cutoff = time.time() - cleanup_after_seconds
+        removed = 0
+        for meta in root.glob("*/metadata.json"):
+            jid = meta.parent.name
+            if not re.fullmatch(r"[0-9a-f]{32}", jid):
+                continue
+            if jid in pending or jid in active:
+                continue
+            async with locks.setdefault(jid, asyncio.Lock()):
+                if jid in pending or jid in active or not meta.is_file():
+                    continue
+                try:
+                    record = json.loads(meta.read_text("utf-8"))
+                    if record.get("id") != jid:
+                        continue
+                    # Track actual file writes, too: chunk requests don't update
+                    # metadata.json until a part finishes.
+                    last_activity = meta.stat().st_mtime
+                    updated = record.get("updated")
+                    if isinstance(updated, str):
+                        try:
+                            last_activity = max(
+                                last_activity,
+                                datetime.fromisoformat(updated.replace("Z", "+00:00")).timestamp()
+                            )
+                        except ValueError:
+                            pass
+                    for item in meta.parent.iterdir():
+                        if item.is_file():
+                            last_activity = max(last_activity, item.stat().st_mtime)
+                    if last_activity > cutoff:
+                        continue
+                    # Never remove a currently active or queued Telegram job.
+                    if jid in pending or jid in active:
+                        continue
+                    await asyncio.to_thread(shutil.rmtree, meta.parent)
+                    locks.pop(jid, None)
+                    removed += 1
+                    LOG.info("Cleaned inactive browser job=%s phase=%s after 24h",
+                             jid, record.get("phase"))
+                except FileNotFoundError:
+                    continue
+                except Exception:
+                    LOG.exception("Unable to clean stale upload job=%s", jid)
+        return removed
+
+    async def run_cleanup():
+        while True:
+            try:
+                removed = await cleanup_stale_jobs()
+                if removed:
+                    LOG.info("Browser job cleanup removed %d inactive jobs", removed)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("Browser job cleanup scan failed")
+            await asyncio.sleep(cleanup_interval_seconds)
+
     async def startup():
-        nonlocal queue_worker
+        nonlocal queue_worker, cleanup_worker
         if queue_worker and not queue_worker.done():
             return
         queue_worker = asyncio.create_task(run_queue(), name="browser-upload-queue")
@@ -421,9 +484,18 @@ def setup_browser_upload(app, client, api_key, chat_id, data_dir,
                 record["auto_retry_count"] = int(record.get("auto_retry_count", 0)) + 1
             enqueue(path, record)
         LOG.info("Browser queue started: %s recovered jobs", len(recovered))
+        if not cleanup_worker or cleanup_worker.done():
+            cleanup_worker = asyncio.create_task(run_cleanup(), name="browser-job-cleanup")
 
     async def shutdown():
-        nonlocal queue_worker
+        nonlocal queue_worker, cleanup_worker
+        if cleanup_worker:
+            cleanup_worker.cancel()
+            try:
+                await cleanup_worker
+            except asyncio.CancelledError:
+                pass
+            cleanup_worker = None
         if queue_worker:
             queue_worker.cancel()
             try:
