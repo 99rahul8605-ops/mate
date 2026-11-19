@@ -1,4 +1,4 @@
-// Telegram Desktop Console uploader (no Tampermonkey)
+// Telegram Desktop Console uploader v1.1 (streaming; no Tampermonkey)
 // Run this code only for media you are authorized to transfer.
 // For requests to third-party video origins, normal browser CORS still applies.
 (function () {
@@ -17,8 +17,8 @@
   }
   const VIDEO = 'video.badassworks.xyz';
   const ID = 'lecture-desktop-transfer-v1';
-  const CHUNK = 10 * 1024 * 1024;
-  const DEFAULT_PARALLEL_PARTS = 5;
+  const CHUNK = 512 * 1024; // Stream only 512 KiB per VPS request.
+  const DEFAULT_PARALLEL_PARTS = 2; // Safer for slow Telegram Desktop WebViews.
   const WORKERS_KEY = "browser_upload_workers";
   const getWorkers = () => {
     const saved = Number(GM_getValue(WORKERS_KEY, DEFAULT_PARALLEL_PARTS));
@@ -27,6 +27,7 @@
   const SAVED_JOBS = 'lecture_upload_queue_v1';
   if (document.getElementById(ID)) {console.log('[LectureDesktop] Uploader panel already exists');return;}
   let active = false, cancel = false;
+  const sourceControllers = new Set();
 
   const root = document.createElement('div');
   root.id = ID;
@@ -361,27 +362,88 @@
     setWorkersLabel();
     say('✅ Browser workers saved: '+value+'. Will apply to the next transfer.');
   };
-  stop.onclick=()=>{cancel=true;say('Pausing after current request. Resume by clicking Upload Lecture.');};
+  stop.onclick=()=>{
+    cancel=true;
+    for(const controller of sourceControllers) controller.abort();
+    say('⏸ Pausing. Bytes already accepted by VPS will remain saved for resume.');
+  };
   async function uploadPart(job, i, u, key, knownOffset=0) {
-    // Requesting media bytes from the browser network, NOT from Railway.
-    const r = await gm({url:u, responseType:'arraybuffer',timeout:300000});
-    const bytes = r.response;
-    if (!(bytes instanceof ArrayBuffer) || bytes.byteLength < 12)
-      throw new Error('Invalid video response: part '+i);
-    const sig = String.fromCharCode(...new Uint8Array(bytes.slice(4,8)));
-    if(sig!=='ftyp') throw new Error('Not an MP4: part '+i);
-    let offset=knownOffset;
-    if(offset>bytes.byteLength) throw new Error('Server part offset exceeds media length');
-    while(offset<bytes.byteLength) {
-      if(cancel) return false;
-      const end=Math.min(offset+CHUNK,bytes.byteLength);
+    // Stream the video into bounded 512-KiB VPS writes. No full-MP4 buffering.
+    // For a resumed part we read from its start but skip the bytes VPS already has.
+    // This is compatible even with origins that do not support HTTP Range.
+    const controller=new AbortController();
+    sourceControllers.add(controller);
+    let reader;
+    let received=0, offset=knownOffset;
+    let buffer=[], bufferedBytes=0, headerBytes=0;
+    const header=new Uint8Array(12);
+    const mb=n=>(n/(1024*1024)).toFixed(2);
+    const started=Date.now();
+    let lastReport=0;
+    const report=force=>{
+      const now=Date.now();
+      if(!force && now-lastReport<1500) return;
+      lastReport=now;
+      const seconds=Math.max(1,(now-started)/1000);
+      say('⬇️ Part '+(i+1)+' | received '+mb(received)+' MB'
+        +' | VPS '+mb(offset)+' MB | '+(received/1024/seconds).toFixed(1)+' KB/s');
+    };
+    const flush=async()=>{
+      if(!bufferedBytes)return;
+      if(cancel)return;
+      const data=new Uint8Array(bufferedBytes);
+      let at=0;
+      for(const piece of buffer) {data.set(piece,at);at+=piece.byteLength;}
+      buffer=[];bufferedBytes=0;
       const resp=await api('PUT','/browser-jobs/'+job+'/parts/'+i+'?offset='+offset,
-                           key,bytes.slice(offset,end));
+                           key,data.buffer);
+      if(!Number.isFinite(resp.offset) || resp.offset!==offset+data.byteLength)
+        throw new Error('Unexpected VPS offset for part '+i);
       offset=resp.offset;
-      say('Part '+(i+1)+' uploading: '+Math.round(offset*100/bytes.byteLength)+'%');
+      report(true);
+    };
+    try {
+      const response=await fetch(u,{signal:controller.signal,credentials:'omit'});
+      if(!response.ok)throw new Error('Video part '+i+' HTTP '+response.status);
+      if(!response.body)throw new Error('Streaming response unavailable in this WebView');
+      reader=response.body.getReader();
+      while(!cancel) {
+        const {done,value}=await reader.read();
+        if(done)break;
+        if(!value?.byteLength)continue;
+        const begin=received;
+        if(headerBytes<12) {
+          const n=Math.min(12-headerBytes,value.byteLength);
+          header.set(value.subarray(0,n),headerBytes);
+          headerBytes+=n;
+          if(headerBytes>=8 && String.fromCharCode(...header.subarray(4,8))!=='ftyp')
+            throw new Error('Invalid MP4 header for part '+i);
+        }
+        received+=value.byteLength;
+        const skip=Math.max(0,Math.min(value.byteLength,knownOffset-begin));
+        if(skip<value.byteLength) {
+          buffer.push(value.subarray(skip));
+          bufferedBytes+=value.byteLength-skip;
+          if(bufferedBytes>=CHUNK)await flush();
+        }
+        report(false);
+      }
+      if(cancel)return false;
+      if(received<12)throw new Error('Empty/invalid video part '+i);
+      if(knownOffset>received)throw new Error('VPS saved offset exceeds part size');
+      await flush();
+      if(cancel)return false;
+      if(offset!==received)throw new Error('Incomplete transfer: '+offset+'/'+received);
+      await api('POST','/browser-jobs/'+job+'/parts/'+i+'/finish',key,{size:received});
+      report(true);
+      return true;
+    } catch(e) {
+      if(cancel && (e.name==='AbortError'||e.name==='TypeError'))return false;
+      throw e;
+    } finally {
+      sourceControllers.delete(controller);
+      if(reader) {try {await reader.cancel();} catch {}}
     }
-    await api('POST','/browser-jobs/'+job+'/parts/'+i+'/finish',key,{size:bytes.byteLength});
-    return true;
   }
   send.onclick=async()=>{
     if(active)return;
@@ -461,8 +523,10 @@
             uploaded++;
             say('✅ '+uploaded+'/'+count+' parts | '+speed()+' elapsed');
           } catch(e){
+            if(cancel && e.name==='AbortError')return;
             failed=e;
             cancel=true;
+            for(const controller of sourceControllers)controller.abort();
             return;
           }
         }
