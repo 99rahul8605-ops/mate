@@ -1,4 +1,4 @@
-// Telegram Desktop Console uploader v1.1 (streaming; no Tampermonkey)
+// Telegram Desktop Console uploader v1.2 (single MP4 pieces + HTTP Range resume)
 // Run this code only for media you are authorized to transfer.
 // For requests to third-party video origins, normal browser CORS still applies.
 (function () {
@@ -368,73 +368,104 @@
     say('⏸ Pausing. Bytes already accepted by VPS will remain saved for resume.');
   };
   async function uploadPart(job, i, u, key, knownOffset=0) {
-    // Stream the video into bounded 512-KiB VPS writes. No full-MP4 buffering.
-    // For a resumed part we read from its start but skip the bytes VPS already has.
-    // This is compatible even with origins that do not support HTTP Range.
+    // CA Mate's Offline Save uses /p/{i} for standalone pieces.
+    // /b/{i} may contain several concatenated pieces (X-Sizes).
+    // Resume by asking the server only for bytes that VPS does not have.
     const controller=new AbortController();
     sourceControllers.add(controller);
     let reader;
-    let received=0, offset=knownOffset;
-    let buffer=[], bufferedBytes=0, headerBytes=0;
+    let offset=knownOffset, received=0, bytesLeft=0;
+    let expectedTotal=null, headerBytes=0;
     const header=new Uint8Array(12);
-    const mb=n=>(n/(1024*1024)).toFixed(2);
+    let buffer=[], bufferedBytes=0;
+    const mb=n=>(n/1048576).toFixed(2);
     const started=Date.now();
     let lastReport=0;
     const report=force=>{
       const now=Date.now();
-      if(!force && now-lastReport<1500) return;
+      if(!force && now-lastReport<1700)return;
       lastReport=now;
-      const seconds=Math.max(1,(now-started)/1000);
+      const elapsed=Math.max(1,(now-started)/1000);
       say('⬇️ Part '+(i+1)+' | received '+mb(received)+' MB'
-        +' | VPS '+mb(offset)+' MB | '+(received/1024/seconds).toFixed(1)+' KB/s');
+        +' | VPS '+mb(offset)+' MB | '+(received/1024/elapsed).toFixed(1)+' KB/s'
+        +(expectedTotal?' / '+mb(expectedTotal)+' MB':''));
     };
     const flush=async()=>{
-      if(!bufferedBytes)return;
-      if(cancel)return;
+      if(!bufferedBytes||cancel)return;
       const data=new Uint8Array(bufferedBytes);
-      let at=0;
-      for(const piece of buffer) {data.set(piece,at);at+=piece.byteLength;}
+      let pos=0;
+      for(const piece of buffer){data.set(piece,pos);pos+=piece.byteLength;}
       buffer=[];bufferedBytes=0;
-      const resp=await api('PUT','/browser-jobs/'+job+'/parts/'+i+'?offset='+offset,
-                           key,data.buffer);
-      if(!Number.isFinite(resp.offset) || resp.offset!==offset+data.byteLength)
-        throw new Error('Unexpected VPS offset for part '+i);
-      offset=resp.offset;
+      const result=await api('PUT','/browser-jobs/'+job+'/parts/'+i+'?offset='+offset,
+        key,data.buffer);
+      if(!Number.isSafeInteger(result.offset) || result.offset!==offset+data.byteLength)
+        throw new Error('VPS offset mismatch for part '+i);
+      offset=result.offset;
       report(true);
     };
     try {
-      const response=await fetch(u,{signal:controller.signal,credentials:'omit'});
+      const requestHeaders=knownOffset>0?{Range:'bytes='+knownOffset+'-'}:{};
+      const response=await fetch(u,{
+        headers:requestHeaders,signal:controller.signal,credentials:'omit'
+      });
       if(!response.ok)throw new Error('Video part '+i+' HTTP '+response.status);
-      if(!response.body)throw new Error('Streaming response unavailable in this WebView');
+      if(!response.body)throw new Error('Streaming unavailable in this WebView');
+      if(response.headers.get('X-Sizes')?.split(',').filter(Boolean).length>1)
+        throw new Error('Unexpected batched video response for /p/'+i);
+      const contentRange=response.headers.get('Content-Range');
+      const rangeMatch=contentRange?.match(/^bytes\s+(\d+)-(\d+)\/(\d+)$/i);
+      let skipPrefix=0;
+      if(knownOffset>0 && response.status===206){
+        if(!rangeMatch || Number(rangeMatch[1])!==knownOffset)
+          throw new Error('Video server returned unexpected Range offset for part '+i);
+      } else if(knownOffset>0 && response.status===200) {
+        // Some proxies ignore Range; preserve compatibility by discarding
+        // previously received bytes, but never send duplicates to the VPS.
+        skipPrefix=knownOffset;
+      } else if(knownOffset===0 && response.status===206 && rangeMatch &&
+                Number(rangeMatch[1])!==0) {
+        throw new Error('Video part starts at unexpected offset');
+      }
+      const length=Number(response.headers.get('Content-Length'));
+      expectedTotal=rangeMatch?Number(rangeMatch[3]):
+        Number.isFinite(length)&&length>0?length:null;
+      if(expectedTotal!==null && (!Number.isSafeInteger(expectedTotal) ||
+         expectedTotal<12 || knownOffset>expectedTotal))
+        throw new Error('Invalid video part length');
       reader=response.body.getReader();
-      while(!cancel) {
+      while(!cancel){
         const {done,value}=await reader.read();
         if(done)break;
         if(!value?.byteLength)continue;
-        const begin=received;
-        if(headerBytes<12) {
-          const n=Math.min(12-headerBytes,value.byteLength);
-          header.set(value.subarray(0,n),headerBytes);
-          headerBytes+=n;
-          if(headerBytes>=8 && String.fromCharCode(...header.subarray(4,8))!=='ftyp')
-            throw new Error('Invalid MP4 header for part '+i);
-        }
         received+=value.byteLength;
-        const skip=Math.max(0,Math.min(value.byteLength,knownOffset-begin));
-        if(skip<value.byteLength) {
-          buffer.push(value.subarray(skip));
-          bufferedBytes+=value.byteLength-skip;
-          if(bufferedBytes>=CHUNK)await flush();
+        let piece=value;
+        if(skipPrefix>0) {
+          const skip=Math.min(skipPrefix,piece.byteLength);
+          piece=piece.subarray(skip);skipPrefix-=skip;
         }
+        if(!piece.byteLength){report(false);continue;}
+        if(knownOffset===0 && headerBytes<12){
+          const copy=Math.min(12-headerBytes,piece.byteLength);
+          header.set(piece.subarray(0,copy),headerBytes);headerBytes+=copy;
+          if(headerBytes>=8 &&
+             String.fromCharCode(...header.subarray(4,8))!=='ftyp')
+            throw new Error('/p/'+i+' response is not a standalone MP4');
+        }
+        buffer.push(piece);
+        bufferedBytes+=piece.byteLength;
+        if(bufferedBytes>=CHUNK)await flush();
         report(false);
       }
       if(cancel)return false;
-      if(received<12)throw new Error('Empty/invalid video part '+i);
-      if(knownOffset>received)throw new Error('VPS saved offset exceeds part size');
+      if(skipPrefix>0)throw new Error('Video response shorter than VPS offset');
       await flush();
       if(cancel)return false;
-      if(offset!==received)throw new Error('Incomplete transfer: '+offset+'/'+received);
-      await api('POST','/browser-jobs/'+job+'/parts/'+i+'/finish',key,{size:received});
+      if(offset<12)throw new Error('Invalid tiny video part '+i);
+      if(expectedTotal!==null && offset!==expectedTotal)
+        throw new Error('Incomplete part '+i+': VPS '+offset+'/'+expectedTotal);
+      if(expectedTotal===null && received===0)
+        throw new Error('Empty video response for part '+i);
+      await api('POST','/browser-jobs/'+job+'/parts/'+i+'/finish',key,{size:offset});
       report(true);
       return true;
     } catch(e) {
@@ -442,7 +473,7 @@
       throw e;
     } finally {
       sourceControllers.delete(controller);
-      if(reader) {try {await reader.cancel();} catch {}}
+      if(reader){try{await reader.cancel();}catch{}}
     }
   }
   send.onclick=async()=>{
@@ -465,7 +496,9 @@
       if(!Array.isArray(metadata.parts) || !metadata.parts.length)
         throw new Error('Invalid lecture manifest');
       const count=metadata.parts.length;
-      const keyName='browser_job_'+lectureId;
+      say('🎬 '+count+' individual video pieces detected');
+      // New namespace prevents reusing jobs with old /b/ batched parts.
+      const keyName='browser_job_single_p_v2_'+lectureId;
       let job=GM_getValue(keyName,'');
       let state;
       if(job){
@@ -516,7 +549,7 @@
             if(Number(m.searchParams.get('e'))<=Date.now()/1000)
               throw new Error('Signed link expired. Reopen the lecture and resume.');
             const u=new URL(manifest);
-            u.pathname=(i%2===0?'/p/':'/b/')+i;
+            u.pathname='/p/'+i;
             say('⬇️ '+(uploaded)+'/'+count+' saved | Browser workers: '+parallelWorkers);
             const ok=await uploadPart(job,i,u.toString(),key,Number(state.offsets?.[String(i)]||0));
             if(!ok) return;
