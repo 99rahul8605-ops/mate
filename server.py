@@ -17,6 +17,7 @@ from urllib.parse import urlsplit, urlunsplit, parse_qs
 import aiohttp
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pyrogram import Client, filters, utils as pyrogram_utils
 from pyrogram.handlers import MessageHandler
@@ -658,6 +659,16 @@ async def lifespan(app):
 app = FastAPI(
     title="Lecture to Telegram",
     lifespan=lifespan
+)
+
+# Allow browser-based requests from Telegram Desktop's CA Mate WebView.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://foundation.badassworks.xyz"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+    allow_headers=["X-API-Key", "Content-Type"],
+    max_age=600,
 )
 
 browser_upload_startup, browser_upload_shutdown = setup_browser_upload(
